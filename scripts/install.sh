@@ -1,8 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# install.sh — Install an executable as a macOS launchd user agent
+# install.sh — Install an executable as a persistent user service
+# Supports macOS launchd and Linux systemd.
 # Usage: install.sh <service-name> <command> [args...] [--workdir <dir>] [--env KEY=VALUE ...]
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/_detect.sh"
 
 usage() {
   echo "Usage: $0 <service-name> <command> [args...] [--workdir <dir>] [--env KEY=VALUE ...]"
@@ -12,10 +16,7 @@ usage() {
 [[ $# -lt 2 ]] && usage
 
 SERVICE_NAME="$1"; shift
-LABEL="ai.toolguard.${SERVICE_NAME}"
-PLIST_DIR="$HOME/Library/LaunchAgents"
-PLIST_PATH="${PLIST_DIR}/${LABEL}.plist"
-LOG_DIR="$HOME/Library/Logs/toolguard/${SERVICE_NAME}"
+set_paths "$SERVICE_NAME"
 WORKDIR="$HOME"
 
 # Parse command, args, and options
@@ -55,43 +56,39 @@ fi
 # Expand workdir
 WORKDIR=$(eval echo "$WORKDIR")
 
-# Create directories
-mkdir -p "$PLIST_DIR" "$LOG_DIR"
+install_launchd() {
+  mkdir -p "$PLIST_DIR" "$LOG_DIR"
 
-# Unload existing service if present
-if launchctl list "$LABEL" &>/dev/null; then
-  echo "Unloading existing service ${LABEL}..."
-  launchctl unload "$PLIST_PATH" 2>/dev/null || true
-fi
+  if launchctl list "$LABEL" &>/dev/null; then
+    echo "Unloading existing service ${LABEL}..."
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+  fi
 
-# Build ProgramArguments
-PROGRAM_ARGS="    <array>
+  PROGRAM_ARGS="    <array>
       <string>${COMMAND}</string>"
-for arg in "${ARGS[@]}"; do
-  PROGRAM_ARGS+="
+  for arg in "${ARGS[@]}"; do
+    PROGRAM_ARGS+="
       <string>${arg}</string>"
-done
-PROGRAM_ARGS+="
+  done
+  PROGRAM_ARGS+="
     </array>"
 
-# Build EnvironmentVariables section
-ENV_SECTION=""
-if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
-  ENV_SECTION="    <key>EnvironmentVariables</key>
+  ENV_SECTION=""
+  if [[ ${#ENV_VARS[@]} -gt 0 ]]; then
+    ENV_SECTION="    <key>EnvironmentVariables</key>
     <dict>"
-  for env_pair in "${ENV_VARS[@]}"; do
-    KEY="${env_pair%%=*}"
-    VALUE="${env_pair#*=}"
-    ENV_SECTION+="
+    for env_pair in "${ENV_VARS[@]}"; do
+      KEY="${env_pair%%=*}"
+      VALUE="${env_pair#*=}"
+      ENV_SECTION+="
       <key>${KEY}</key>
       <string>${VALUE}</string>"
-  done
-  ENV_SECTION+="
+    done
+    ENV_SECTION+="
     </dict>"
-fi
+  fi
 
-# Write plist
-cat > "$PLIST_PATH" <<EOF
+  cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -115,11 +112,57 @@ ${ENV_SECTION}
 </plist>
 EOF
 
-# Load and start service
-launchctl load "$PLIST_PATH"
+  launchctl load "$PLIST_PATH"
 
-echo "Service '${SERVICE_NAME}' installed and started."
-echo "  Label:  ${LABEL}"
-echo "  Plist:  ${PLIST_PATH}"
-echo "  Logs:   ${LOG_DIR}/"
-echo "  Status: $(launchctl list "$LABEL" 2>/dev/null | head -1 || echo 'unknown')"
+  echo "Service '${SERVICE_NAME}' installed and started (launchd)."
+  echo "  Label:  ${LABEL}"
+  echo "  Plist:  ${PLIST_PATH}"
+  echo "  Logs:   ${LOG_DIR}/"
+  echo "  Status: $(launchctl list "$LABEL" 2>/dev/null | head -1 || echo 'unknown')"
+}
+
+install_systemd() {
+  mkdir -p "$UNIT_DIR" "$LOG_DIR"
+
+  EXEC_START="$COMMAND"
+  for arg in "${ARGS[@]}"; do
+    EXEC_START+=" $arg"
+  done
+
+  ENV_LINES=""
+  for env_pair in "${ENV_VARS[@]}"; do
+    ENV_LINES+="Environment=${env_pair}"$'\n'
+  done
+
+  cat > "$UNIT_PATH" <<EOF
+[Unit]
+Description=Toolguard service: ${SERVICE_NAME}
+
+[Service]
+Type=simple
+ExecStart=${EXEC_START}
+WorkingDirectory=${WORKDIR}
+Restart=always
+RestartSec=5
+StandardOutput=append:${LOG_DIR}/stdout.log
+StandardError=append:${LOG_DIR}/stderr.log
+${ENV_LINES}
+[Install]
+WantedBy=default.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$LABEL"
+
+  echo "Service '${SERVICE_NAME}' installed and started (systemd)."
+  echo "  Label:  ${LABEL}"
+  echo "  Unit:   ${UNIT_PATH}"
+  echo "  Logs:   ${LOG_DIR}/ (also: journalctl --user -u ${LABEL})"
+  echo "  Status: $(systemctl --user is-active "$LABEL" 2>/dev/null || echo 'unknown')"
+}
+
+if [[ "$BACKEND" == "launchd" ]]; then
+  install_launchd
+else
+  install_systemd
+fi
